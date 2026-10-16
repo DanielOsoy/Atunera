@@ -1,30 +1,65 @@
+# compose.yaml — Configuración Docker Compose del sistema Atunera
+#
+# Define dos servicios que se comunican en una red interna de Docker:
+#   - app : servidor Apache+PHP (backend + frontend SPA)
+#   - db  : MySQL 8.0 (base de datos)
+#
+# Uso:
+#   Levantar:  docker compose -f .devcontainer/compose.yaml up --build
+#   Detener:   docker compose -f .devcontainer/compose.yaml down
+#
+# El código fuente se monta como volumen en el contenedor app, por lo que
+# los cambios en los archivos PHP se reflejan sin reconstruir la imagen.
+
 services:
+
+  # ============================================================
+  # Servicio: app
+  # Servidor web Apache con PHP 8.2.
+  # Sirve tanto el frontend (index.php) como los endpoints de la API.
+  # ============================================================
   app:
     build:
-      context: ..
-      dockerfile: .devcontainer/Dockerfile
+      context: ..                          # Raíz del proyecto como contexto de build
+      dockerfile: .devcontainer/Dockerfile # Imagen basada en php:8.2-apache
     volumes:
+      # Monta el proyecto completo en /var/www/html del contenedor.
+      # "cached" mejora performance de lectura en macOS/Windows.
       - ..:/var/www/html:cached
+    ports:
+      - "8080:80"   # La app es accesible en http://localhost:8080
     depends_on:
-      - db
+      - db           # Docker espera a que el contenedor db exista antes de arrancar app
     environment:
+      # Credenciales de conexión a MySQL — leídas por config/database.php via getenv()
+      # El hostname "db" resuelve al contenedor MySQL dentro de la red de Docker
       DB_HOST: db
       DB_PORT: 3306
       DB_NAME: industria_atunera
       DB_USER: app
       DB_PASS: app123
 
+  # ============================================================
+  # Servicio: db
+  # Motor de base de datos MySQL 8.0.
+  # El script de inicialización (industria_atunera.sql) crea tablas y datos
+  # base solo cuando el volumen mysql-data está vacío (primer arranque).
+  # ============================================================
   db:
     image: mysql:8.0
-    restart: unless-stopped
+    restart: unless-stopped               # Se reinicia automáticamente salvo que se detenga manualmente
     environment:
-      MYSQL_DATABASE: industria_atunera
-      MYSQL_USER: app
-      MYSQL_PASSWORD: app123
-      MYSQL_ROOT_PASSWORD: root123
+      MYSQL_DATABASE:      industria_atunera
+      MYSQL_USER:          app
+      MYSQL_PASSWORD:      app123
+      MYSQL_ROOT_PASSWORD: root123       # Solo para acceso admin directo al contenedor
     volumes:
+      # Persistencia de datos: los datos de MySQL sobreviven a reinicios del contenedor
       - mysql-data:/var/lib/mysql
+      # Script SQL de inicialización — ejecutado automáticamente por MySQL en el primer boot
+      # Crea las tablas: especies, tallas, barcos, predicciones
       - ../industria_atunera.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
 
+# Volumen nombrado para persistir los datos de MySQL entre reinicios
 volumes:
   mysql-data:
