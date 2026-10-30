@@ -1,8 +1,10 @@
 # compose.yaml — Configuración Docker Compose del sistema Atunera
 #
-# Define dos servicios que se comunican en una red interna de Docker:
-#   - app : servidor Apache+PHP (backend + frontend SPA)
-#   - db  : MySQL 8.0 (base de datos)
+# Servicios en una red interna de Docker:
+#   - app          : servidor Apache+PHP (backend + frontend SPA)
+#   - db           : MySQL 8.0 (copia local que lee la app)
+#   - empresa      : SQL Server que simula la base de la planta (solo simulación)
+#   - empresa-init : crea esquema, vistas y usuario de solo lectura en `empresa`
 #
 # Uso:
 #   Levantar:  docker compose -f .devcontainer/compose.yaml up --build
@@ -60,6 +62,121 @@ services:
       # Crea las tablas: especies, tallas, barcos, predicciones
       - ../industria_atunera.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
 
-# Volumen nombrado para persistir los datos de MySQL entre reinicios
+  # ============================================================
+  # Servicio: empresa  (SOLO SIMULACIÓN)
+  # SQL Server que imita la base de datos de la planta.
+  # Las contraseñas vienen de .devcontainer/.env (no se suben a GitHub).
+  # Puerto publicado solo en 127.0.0.1 para inspeccionarla con SSMS/Azure Data Studio.
+  # ============================================================
+  empresa:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    restart: unless-stopped
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_PID: Developer
+      MSSQL_SA_PASSWORD: ${EMPRESA_SA_PASSWORD:?Falta EMPRESA_SA_PASSWORD en .devcontainer/.env}
+      MSSQL_MEMORY_LIMIT_MB: 2048
+    ports:
+      - "127.0.0.1:14330:1433"
+    volumes:
+      - mssql-data:/var/opt/mssql
+    healthcheck:
+      test: ["CMD-SHELL", "SQLCMDPASSWORD=\"$$MSSQL_SA_PASSWORD\" /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -C -b -Q \"SELECT 1\" -o /dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+
+  # ============================================================
+  # Servicio: empresa-init  (SOLO SIMULACIÓN)
+  # Corre una vez: crea el esquema, las vistas de integración y el
+  # usuario de solo lectura. Es idempotente; se puede volver a correr con:
+  #   docker compose -f .devcontainer/compose.yaml run --rm empresa-init
+  # ============================================================
+  empresa-init:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    depends_on:
+      empresa:
+        condition: service_healthy
+    environment:
+      SQLCMDPASSWORD: ${EMPRESA_SA_PASSWORD}
+      LECTOR_PASS: ${EMPRESA_LECTOR_PASSWORD:?Falta EMPRESA_LECTOR_PASSWORD en .devcontainer/.env}
+    volumes:
+      - ../simulacion/empresa:/scripts:ro
+    entrypoint: ["/opt/mssql-tools18/bin/sqlcmd", "-S", "empresa", "-U", "sa", "-C", "-b", "-f", "65001", "-i", "/scripts/01-esquema.sql"]
+    restart: "no"
+
+  # ============================================================
+  # Servicio: simulador  (SOLO SIMULACIÓN, se ejecuta a mano)
+  # Genera partidas simuladas en `empresa`. Hace de "sistema de la planta",
+  # por eso escribe con el usuario administrador.
+  # Uso:
+  #   docker compose -f .devcontainer/compose.yaml run --rm simulador historico
+  #   docker compose -f .devcontainer/compose.yaml run --rm simulador nuevos
+  #   docker compose -f .devcontainer/compose.yaml run --rm simulador resumen
+  # ============================================================
+  simulador:
+    build:
+      context: ..
+      dockerfile: .devcontainer/Dockerfile.herramientas
+    image: atunera-herramientas
+    profiles: ["herramientas"]
+    depends_on:
+      empresa:
+        condition: service_healthy
+    environment:
+      EMPRESA_HOST: empresa
+      EMPRESA_PORT: 1433
+      EMPRESA_DB: planta_empresa
+      EMPRESA_ADMIN_USER: sa
+      EMPRESA_ADMIN_PASSWORD: ${EMPRESA_SA_PASSWORD}
+      TZ: America/Guatemala
+    volumes:
+      - ../simulacion:/app/simulacion:ro
+    entrypoint: ["php", "simulacion/generador.php"]
+
+  # ============================================================
+  # Servicio: sincronizador
+  # Copia las partidas de `empresa` a la base local cada 12 horas.
+  # Lee con el usuario de solo lectura y hoy escribe SOLO en la base simulada.
+  # Uso manual:
+  #   docker compose -f .devcontainer/compose.yaml run --rm sincronizador ahora
+  #   docker compose -f .devcontainer/compose.yaml run --rm sincronizador estado
+  #   docker compose -f .devcontainer/compose.yaml run --rm sincronizador reactivar
+  # ============================================================
+  sincronizador:
+    build:
+      context: ..
+      dockerfile: .devcontainer/Dockerfile.herramientas
+    image: atunera-herramientas
+    restart: unless-stopped
+    init: true
+    depends_on:
+      empresa:
+        condition: service_healthy
+      db:
+        condition: service_started
+    environment:
+      TZ: America/Guatemala
+      EMPRESA_HOST: empresa
+      EMPRESA_PORT: 1433
+      EMPRESA_DB: planta_empresa
+      EMPRESA_USER: sync_lector
+      EMPRESA_PASSWORD: ${EMPRESA_LECTOR_PASSWORD}
+      # Solo para la simulación: el SQL Server del contenedor usa un certificado autofirmado
+      EMPRESA_CONFIAR_CERTIFICADO: "yes"
+      LOCAL_HOST: db
+      LOCAL_PORT: 3306
+      LOCAL_DB: industria_atunera_sim
+      LOCAL_USER: sync_sim
+      LOCAL_PASSWORD: ${LOCAL_SIM_SYNC_PASSWORD:?Falta LOCAL_SIM_SYNC_PASSWORD en .devcontainer/.env}
+      SYNC_HORAS: "02:00,14:00"
+    volumes:
+      - ../sync:/app/sync:ro
+    entrypoint: ["php", "sync/sincronizar.php"]
+    command: ["programar"]
+
+# Volúmenes nombrados para persistir los datos entre reinicios
 volumes:
   mysql-data:
+  mssql-data:
