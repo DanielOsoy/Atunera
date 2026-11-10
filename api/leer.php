@@ -27,10 +27,11 @@
  * ponderado estándar (cada talla pondera distinto según cuántos registros tiene).
  */
 
-header("Access-Control-Allow-Origin: *");
-header("Content-Type: application/json; charset=UTF-8");
-
+require_once __DIR__ . '/../seguridad/sesion.php';
 require_once __DIR__ . '/../config/database.php';
+
+// Solo usuarios con sesión; todos los roles leen el historial
+requerirSesionApi();
 
 try {
     $db = (new Database())->getConnection();
@@ -59,7 +60,7 @@ try {
     $tallas    = $stmtTalla->fetchAll(PDO::FETCH_ASSOC);
 
     // Barcos registrados — se usan para auto-detectar el barco desde el código de compra
-    // (posiciones 2-4 del código son la abreviatura del barco, ej. "ISY" de "TISISY12455")
+    // (posiciones 2-4 del código son la abreviatura del barco, ej. "SY1" de "TISY12455")
     $stmtBarcos = $db->query("SELECT id, nombre, abreviatura FROM barcos ORDER BY nombre");
     $barcos     = $stmtBarcos->fetchAll(PDO::FETCH_ASSOC);
 
@@ -71,6 +72,8 @@ try {
     // --- Historial completo ---
     // Se devuelven TODOS los registros (sin LIMIT) para que las gráficas y KPIs
     // globales sean precisos. El frontend agrupa por compra para evitar saturación visual.
+    // Se envían fila por fila y sin búfer de MySQL: la memoria de PHP no crece con el historial.
+    $db->setAttribute(PDO::MYSQL_ATTR_USE_BUFFERED_QUERY, false);
     $historySql = "
         SELECT
             p.id,
@@ -90,23 +93,39 @@ try {
     ";
 
     $stmtHist = $db->query($historySql);
-    $history  = $stmtHist->fetchAll(PDO::FETCH_ASSOC);
 
-    echo json_encode([
-        "status" => "success",
-        "data"   => [
-            "species"     => $species,
-            "tallas"      => $tallas,
-            "barcos"      => $barcos,
-            "history"     => $history,
-            "tallaCounts" => $tallaCounts
-        ]
-    ], JSON_UNESCAPED_UNICODE);
+    // Comprime si el navegador lo acepta, enviando bloques de 64 KB
+    if (extension_loaded('zlib')) {
+        ob_start('ob_gzhandler', 65536);
+    }
+
+    $flags = JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR;
+    $envioIniciado = true;
+
+    echo '{"status":"success","data":{'
+        . '"species":' . json_encode($species, $flags)
+        . ',"tallas":' . json_encode($tallas, $flags)
+        . ',"barcos":' . json_encode($barcos, $flags)
+        . ',"history":[';
+
+    $separador = '';
+    while ($fila = $stmtHist->fetch(PDO::FETCH_ASSOC)) {
+        echo $separador, json_encode($fila, $flags);
+        $separador = ',';
+    }
+
+    echo '],"tallaCounts":' . json_encode($tallaCounts, $flags) . '}}';
 
 } catch (Throwable $e) {
-    http_response_code(500);
-    echo json_encode([
-        "status"  => "error",
-        "message" => $e->getMessage()
-    ], JSON_UNESCAPED_UNICODE);
+    error_log("leer.php: " . $e->getMessage());
+
+    // Con el envío iniciado no se puede cambiar el código HTTP: el JSON queda
+    // incompleto a propósito para que el frontend lo detecte como fallo.
+    if (empty($envioIniciado)) {
+        http_response_code(500);
+        echo json_encode([
+            "status"  => "error",
+            "message" => "No se pudieron cargar los datos."
+        ], JSON_UNESCAPED_UNICODE);
+    }
 }

@@ -1,3 +1,18 @@
+<?php
+// Solo entra quien tiene sesión; sin ella se va a la bienvenida, y con contraseña temporal, a cambiarla.
+require_once __DIR__ . '/seguridad/sesion.php';
+$usuario  = requerirSesionPagina();
+$permisos = permisosDeRol($usuario['rol']);
+$sesionCliente = [
+    'nombre'    => $usuario['nombre'],
+    'usuario'   => $usuario['usuario'],
+    'rol'       => $usuario['rol'],
+    'rolNombre' => ROLES[$usuario['rol']],
+    'permisos'  => $permisos,
+    'csrf'      => tokenCsrf(),
+];
+$verAdministracion = array_intersect(['ver_sincronizacion', 'ver_bitacora', 'administrar_usuarios'], $permisos) !== [];
+?>
 <!DOCTYPE html>
 <!--
     index.php — SPA principal del sistema Atunera
@@ -9,6 +24,7 @@
     Pantallas disponibles:
       - dashboard  : KPIs de compra, formulario de consulta/registro, monitor en vivo
       - history    : Matriz de trazabilidad, gráfica histórica, modelo predictivo
+      - report     : Resumen ejecutivo de una compra y mejores/peores compras
 
     Dependencias externas (CDN):
       - Tailwind CSS     : utilidades de estilos
@@ -73,6 +89,9 @@
             /* Mostrar la pantalla activa y expandirla */
             .screen-content { display: block !important; height: auto !important; }
 
+            /* El reporte automatizado se imprime solo, sin las otras pantallas */
+            body.report-active .screen-content:not(#report-screen) { display: none !important; }
+
             /* Cards sin sombras ni bordes para impresión limpia */
             .card-pro {
                 border: 1px solid #e2e8f0 !important;
@@ -125,6 +144,15 @@
             <a href="#" onclick="loadScreen('history')" class="sidebar-item flex items-center gap-3 px-4 py-3.5 rounded-xl text-sm font-bold text-slate-600">
                 <i class="fas fa-project-diagram w-5 text-lg"></i> Trazabilidad y Futuro
             </a>
+            <a href="#" onclick="loadScreen('report')" class="sidebar-item flex items-center gap-3 px-4 py-3.5 rounded-xl text-sm font-bold text-slate-600">
+                <i class="fas fa-file-alt w-5 text-lg"></i> Reporte Automatizado
+            </a>
+            <?php if ($verAdministracion): ?>
+            <p class="px-4 text-[10px] font-extrabold text-slate-400 uppercase tracking-widest mb-3 mt-6">Supervisión</p>
+            <a href="#" onclick="loadScreen('admin')" class="sidebar-item flex items-center gap-3 px-4 py-3.5 rounded-xl text-sm font-bold text-slate-600">
+                <i class="fas fa-user-shield w-5 text-lg"></i> Administración
+            </a>
+            <?php endif; ?>
         </nav>
     </aside>
 
@@ -140,11 +168,31 @@
                 <h2 class="text-2xl font-extrabold text-slate-900 tracking-tight" id="screenTitle">Dashboard</h2>
                 <p class="text-xs font-bold text-slate-400 uppercase tracking-widest mt-1">SISTEMA TOMA DE DECISIONES</p>
             </div>
-            <!-- Dispara window.print() — los estilos @media print ocultan navegación -->
-            <button onclick="window.print()" class="bg-slate-800 hover:bg-slate-900 text-white px-5 py-2.5 rounded-lg text-sm font-bold transition-all flex items-center gap-2 shadow-md">
-                <i class="fas fa-file-pdf"></i> Generar Informe PDF
-            </button>
+            <div class="flex items-center gap-4">
+                <!-- Dispara window.print() — los estilos @media print ocultan navegación -->
+                <button onclick="window.print()" class="bg-slate-800 hover:bg-slate-900 text-white px-5 py-2.5 rounded-lg text-sm font-bold transition-all flex items-center gap-2 shadow-md">
+                    <i class="fas fa-file-pdf"></i> Generar Informe PDF
+                </button>
+                <!-- Usuario de la sesión: nombre, rol, cambio de contraseña y cierre de sesión -->
+                <div class="flex items-center gap-3 border-l border-slate-100 pl-4">
+                    <div class="text-right">
+                        <p id="sesionNombre" class="text-sm font-extrabold text-slate-800"><?= h($usuario['nombre']) ?></p>
+                        <p id="sesionRol" class="text-[10px] font-bold text-primary uppercase tracking-widest"><?= h(ROLES[$usuario['rol']]) ?></p>
+                    </div>
+                    <a href="cambiar-clave.php" title="Cambiar contraseña" class="text-slate-400 hover:text-primary"><i class="fas fa-key"></i></a>
+                    <form method="post" action="salir.php">
+                        <input type="hidden" name="csrf" value="<?= h($sesionCliente['csrf']) ?>">
+                        <button type="submit" title="Cerrar sesión" class="text-slate-400 hover:text-rose-600"><i class="fas fa-sign-out-alt"></i></button>
+                    </form>
+                </div>
+            </div>
         </header>
+
+        <!-- Aviso visible cuando falla una carga de datos (ver showAppError) -->
+        <div id="appError" role="alert" class="hidden no-print bg-rose-50 border-b border-rose-200 px-10 py-3 flex items-center justify-between gap-4 shrink-0">
+            <p id="appErrorText" class="text-sm font-bold text-rose-700"></p>
+            <button onclick="retryLoad()" class="bg-rose-600 hover:bg-rose-700 text-white px-4 py-2 rounded-lg text-xs font-bold whitespace-nowrap">Reintentar</button>
+        </div>
 
         <main class="flex-1 overflow-y-auto p-8 bg-slate-50 h-full">
             <div class="max-w-[1500px] mx-auto space-y-8">
@@ -208,12 +256,12 @@
                             <div id="predictionForm" class="space-y-4">
                                 <p class="text-xs font-bold text-slate-400 uppercase tracking-wider mb-2">1. Variables Predictivas</p>
                                 <div class="grid grid-cols-2 gap-3">
-                                    <!-- Campo COMPRA: 9 caracteres, se convierte a mayúsculas al escribir.
+                                    <!-- Campo COMPRA: casi siempre 9 caracteres (hay de 12), se convierte a mayúsculas al escribir.
                                          Al alcanzar 5 chars auto-detecta el barco (chars 2-4 = abreviatura).
                                          Al alcanzar 7+ chars dispara lookupCompra() con debounce de 300ms. -->
                                     <div>
                                         <label class="block text-[10px] font-bold text-slate-500 mb-1">COMPRA</label>
-                                        <input type="text" id="compra" maxlength="9" class="w-full p-2.5 bg-slate-50 border border-slate-200 rounded-lg text-sm font-bold uppercase" placeholder="Ej: TISY12455" required>
+                                        <input type="text" id="compra" maxlength="20" class="w-full p-2.5 bg-slate-50 border border-slate-200 rounded-lg text-sm font-bold uppercase" placeholder="Ej: TISY12455" required>
                                     </div>
                                     <!-- Campo BARCO: solo lectura, se llena automáticamente desde barcosData -->
                                     <div>
@@ -221,6 +269,8 @@
                                         <input type="text" id="barco" class="w-full p-2.5 bg-slate-100 border border-slate-200 rounded-lg text-sm font-bold text-slate-500 cursor-not-allowed" readonly placeholder="Auto-detectado">
                                     </div>
                                 </div>
+                                <!-- Resultado de la búsqueda: el barco se reconoce por el código aunque la compra no exista -->
+                                <p id="compraStatus" class="hidden text-xs font-bold"></p>
                                 <div class="grid grid-cols-2 gap-3">
                                     <!-- Selectores dinámicos cargados desde la API (leer.php).
                                          Al cambiar cualquiera se recalcula la proyección instantáneamente. -->
@@ -238,6 +288,11 @@
                                      y aplica el código de compra como filtro automáticamente -->
                                 <button type="button" id="btnTraceability" onclick="goToTraceability()" class="w-full mt-4 bg-primary hover:bg-sky-600 text-white font-bold py-3.5 rounded-xl transition-colors">
                                     <i class="fas fa-chart-line"></i> VER TRAZABILIDAD Y FUTURO
+                                </button>
+
+                                <!-- Abre el Reporte Automatizado de la compra escrita arriba -->
+                                <button type="button" id="btnReport" onclick="goToReport()" class="w-full bg-slate-800 hover:bg-slate-900 text-white font-bold py-3.5 rounded-xl transition-colors">
+                                    <i class="fas fa-file-alt"></i> GENERAR REPORTE AUTOMATIZADO
                                 </button>
 
                             </div>
@@ -282,6 +337,130 @@
                 </div>
 
                 <!-- =============================================================
+                     PANTALLA: REPORTE AUTOMATIZADO
+                     Contiene (en orden):
+                       1. Controles: compra (opcional), periodo y botón de generar
+                       2. Resumen ejecutivo de la compra seleccionada
+                       3. Resumen del periodo y mejores/peores compras
+                ============================================================= -->
+                <div id="report-screen" class="screen-content space-y-8">
+
+                    <div class="card-pro p-8 no-print">
+                        <div class="flex flex-wrap items-end gap-4">
+                            <div>
+                                <label class="block text-[10px] font-bold text-slate-500 mb-1">COMPRA (OPCIONAL)</label>
+                                <input type="text" id="reportCompra" maxlength="20" class="p-2.5 bg-slate-50 border border-slate-200 rounded-lg text-sm font-bold uppercase w-44" placeholder="Ej: TISY12455">
+                            </div>
+                            <div>
+                                <label class="block text-[10px] font-bold text-slate-500 mb-1">PERIODO</label>
+                                <select id="reportPeriodo" class="p-2.5 bg-slate-50 border border-slate-200 rounded-lg text-sm font-bold w-44">
+                                    <option value="">Todo el historial</option>
+                                </select>
+                            </div>
+                            <button type="button" id="btnGenerateReport" onclick="requestReport()" class="bg-primary hover:bg-sky-600 text-white font-bold px-6 py-2.5 rounded-lg transition-colors">
+                                <i class="fas fa-magic"></i> Generar reporte automatizado
+                            </button>
+                        </div>
+                    </div>
+
+                    <div id="reportEmpty" class="card-pro p-12 text-center text-slate-400 font-bold">
+                        Escribe una compra, o déjala vacía para ver solo el ranking, y genera el reporte.
+                    </div>
+
+                    <div id="reportContent" class="hidden space-y-8">
+                        <div id="reportCompraSection"></div>
+                        <div id="reportPeriodoSection"></div>
+                        <p id="reportMeta" class="text-xs text-slate-400 font-bold"></p>
+                    </div>
+                </div>
+
+                <!-- =============================================================
+                     PANTALLA: ADMINISTRACIÓN (solo roles con permisos de supervisión)
+                     Cada sección aparece solo si el rol tiene el permiso; la API
+                     vuelve a comprobarlo en cada petición.
+                ============================================================= -->
+                <?php if ($verAdministracion): ?>
+                <div id="admin-screen" class="screen-content space-y-8">
+
+                    <?php if (in_array('ver_sincronizacion', $permisos, true)): ?>
+                    <div class="card-pro p-8">
+                        <div class="flex justify-between items-center mb-4">
+                            <h3 class="text-lg font-bold text-slate-800"><i class="fas fa-sync-alt text-primary"></i> Sincronización con la empresa</h3>
+                            <button type="button" id="btnReactivar" onclick="reactivarSincronizacion()" class="hidden bg-rose-600 hover:bg-rose-700 text-white px-4 py-2 rounded-lg text-xs font-bold">
+                                <i class="fas fa-play"></i> Reactivar sincronización
+                            </button>
+                        </div>
+                        <div id="adminSync" class="text-sm text-slate-500">Cargando…</div>
+                    </div>
+                    <?php endif; ?>
+
+                    <?php if (in_array('administrar_usuarios', $permisos, true)): ?>
+                    <div class="card-pro p-8 space-y-6">
+                        <h3 class="text-lg font-bold text-slate-800"><i class="fas fa-users text-primary"></i> Usuarios autorizados</h3>
+
+                        <div id="adminClave" class="hidden bg-amber-50 border border-amber-300 text-amber-800 rounded-lg px-6 py-4 text-sm"></div>
+
+                        <form id="formUsuario" class="flex flex-wrap items-end gap-3 bg-slate-50 rounded-lg p-4" onsubmit="crearUsuario(event)">
+                            <div>
+                                <label class="block text-[10px] font-bold text-slate-500 mb-1">USUARIO</label>
+                                <input id="nuevoUsuario" type="text" required maxlength="40" class="p-2.5 bg-white border border-slate-200 rounded-lg text-sm font-bold w-40" placeholder="ej: mlopez">
+                            </div>
+                            <div>
+                                <label class="block text-[10px] font-bold text-slate-500 mb-1">NOMBRE</label>
+                                <input id="nuevoNombre" type="text" required maxlength="100" class="p-2.5 bg-white border border-slate-200 rounded-lg text-sm font-bold w-56" placeholder="Nombre y apellido">
+                            </div>
+                            <div>
+                                <label class="block text-[10px] font-bold text-slate-500 mb-1">ROL</label>
+                                <select id="nuevoRol" class="p-2.5 bg-white border border-slate-200 rounded-lg text-sm font-bold">
+                                    <?php foreach (ROLES as $valor => $nombre): ?>
+                                    <option value="<?= h($valor) ?>"><?= h($nombre) ?></option>
+                                    <?php endforeach; ?>
+                                </select>
+                            </div>
+                            <button type="submit" class="bg-primary hover:bg-sky-600 text-white font-bold px-5 py-2.5 rounded-lg text-sm"><i class="fas fa-user-plus"></i> Crear cuenta</button>
+                        </form>
+
+                        <div class="overflow-x-auto">
+                            <table class="w-full text-left border-collapse min-w-[860px]">
+                                <thead class="bg-slate-50 text-[10px] font-bold text-slate-400 uppercase">
+                                    <tr>
+                                        <th class="py-3 px-4">Usuario</th>
+                                        <th class="py-3 px-4">Nombre</th>
+                                        <th class="py-3 px-4">Rol</th>
+                                        <th class="py-3 px-4">Estado</th>
+                                        <th class="py-3 px-4">Último acceso</th>
+                                        <th class="py-3 px-4 text-right">Acciones</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="adminUsuarios" class="text-sm"></tbody>
+                            </table>
+                        </div>
+                    </div>
+                    <?php endif; ?>
+
+                    <?php if (in_array('ver_bitacora', $permisos, true)): ?>
+                    <div class="card-pro p-8">
+                        <h3 class="text-lg font-bold text-slate-800 mb-4"><i class="fas fa-clipboard-list text-primary"></i> Bitácora de accesos <span class="text-xs font-bold text-slate-400">(últimos 200 eventos)</span></h3>
+                        <div class="overflow-x-auto h-96 border border-slate-100 rounded-lg">
+                            <table class="w-full text-left border-collapse min-w-[760px]">
+                                <thead class="bg-slate-50 text-[10px] font-bold text-slate-400 uppercase sticky top-0">
+                                    <tr>
+                                        <th class="py-3 px-4">Fecha</th>
+                                        <th class="py-3 px-4">Usuario</th>
+                                        <th class="py-3 px-4">Evento</th>
+                                        <th class="py-3 px-4">Detalle</th>
+                                        <th class="py-3 px-4">IP</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="adminBitacora" class="text-sm"></tbody>
+                            </table>
+                        </div>
+                    </div>
+                    <?php endif; ?>
+                </div>
+                <?php endif; ?>
+
+                <!-- =============================================================
                      PANTALLA: TRAZABILIDAD Y FUTURO
                      Contiene (en orden):
                        1. Matriz de Trazabilidad — tabla completa de registros filtrable
@@ -297,14 +476,14 @@
                             <div class="flex items-center gap-2">
                                 <i class="fas fa-search text-slate-400 text-sm"></i>
                                 <input type="text" id="filterCompra" maxlength="20"
-                                    oninput="filterMatrix(this.value)"
+                                    oninput="onMatrixFilterInput(this.value)"
                                     class="p-2 bg-slate-50 border border-slate-200 rounded-lg text-sm font-bold uppercase w-44"
                                     placeholder="Filtrar compra...">
                                 <span id="matrixCount" class="text-xs text-slate-400 font-bold whitespace-nowrap"></span>
                             </div>
                         </div>
                         <!-- Tabla con scroll vertical fijo (h-80) — encabezados pegajosos (sticky) -->
-                        <div class="overflow-x-auto h-80 border border-slate-100 rounded-lg">
+                        <div id="matrixScroll" class="overflow-x-auto h-80 border border-slate-100 rounded-lg">
                             <table class="w-full text-left border-collapse min-w-[800px]">
                                 <thead class="bg-slate-50 text-[10px] font-bold text-slate-400 uppercase sticky top-0 shadow-sm z-10">
                                     <tr>
@@ -316,8 +495,8 @@
                                         <th class="py-3 px-4 text-center">Status</th>
                                     </tr>
                                 </thead>
-                                <!-- Filas generadas dinámicamente por renderMatrixRows().
-                                     Cada <tr> tiene data-compra para filtrado CSS. -->
+                                <!-- Filas generadas por bloques desde appendMatrixRows() -->
+
                                 <tbody id="tableBody" class="text-sm"></tbody>
                             </table>
                         </div>
@@ -503,29 +682,94 @@
         // de estos registros en lugar de usar el historial global.
         let compraHistoryData = null;
 
-        // =====================================================================
-        // FUNCIÓN: refreshKPIs
-        // Recarga los KPIs globales (toda la BD) sin recargar catálogos.
-        // Se llama después de registrar un nuevo lote para mantener los datos frescos.
-        // =====================================================================
-        async function refreshKPIs() {
-            try {
-                const res    = await fetch('api/leer.php');
-                const result = await res.json();
-                if (result.status !== 'success') return;
+        // Pantalla activa y origen del aviso visible, para que "Reintentar" repita lo que falló
+        let activeScreen   = 'dashboard';
+        let appErrorOrigin = null;
 
-                globalHistoryData = result.data.history;
-                const hist = result.data.history;
-                if (hist.length > 0) {
-                    const sumY   = hist.reduce((s, r) => s + parseFloat(r.rendimiento_esperado), 0);
-                    const alerts = hist.filter(r => r.alerta_status == 1).length;
-                    document.getElementById('kpiRendimiento').innerText = ((sumY / hist.length) * 100).toFixed(1) + '%';
-                    document.getElementById('kpiAlertas').innerText     = alerts;
-                    document.getElementById('kpiVolumen').innerText     = hist.length;
-                }
-                const ponderado = calcWeightedStandard(result.data.tallaCounts ?? []);
-                document.getElementById('kpiPonderado').innerText = ponderado !== null ? ponderado + '%' : '--%';
-            } catch (err) {}
+        // =====================================================================
+        // FUNCIÓN: showAppError / hideAppError / retryLoad
+        // Aviso visible cuando una carga falla, para que nadie decida con una
+        // pantalla vacía o desactualizada creyendo que está bien.
+        //
+        // @param origin  'datos' (leer.php) o 'compra' (buscar.php)
+        // =====================================================================
+        function showAppError(message, err, origin) {
+            console.error(message, err);
+            appErrorOrigin = origin;
+            document.getElementById('appErrorText').innerText = message;
+            document.getElementById('appError').classList.remove('hidden');
+        }
+
+        // Quita el aviso solo si lo generó este mismo origen
+        function hideAppError(origin) {
+            if (appErrorOrigin !== origin) return;
+            appErrorOrigin = null;
+            document.getElementById('appError').classList.add('hidden');
+        }
+
+        function retryLoad() {
+            const origin = appErrorOrigin;
+            hideAppError(origin);
+            if (origin === 'compra') {
+                lookupCompra(document.getElementById('compra').value.trim().toUpperCase());
+            } else {
+                loadScreen(activeScreen);
+            }
+        }
+
+        // =====================================================================
+        // FUNCIÓN: fetchJson
+        // Consulta la API y lanza un error si la respuesta no es válida: código
+        // HTTP de fallo, JSON incompleto o status distinto de 'success'.
+        // =====================================================================
+        async function fetchJson(url, opciones = {}) {
+            const res = await fetch(url, opciones);
+            // Sesión vencida o contraseña temporal: la página de ingreso o de cambio decide qué sigue
+            if (res.status === 401) { location.href = 'login.php?expirada=1'; throw new Error('Sesión terminada'); }
+            if (res.status === 403) {
+                const r = await res.json().catch(() => ({}));
+                if (r.codigo === 'cambio_clave') { location.href = 'cambiar-clave.php'; }
+                throw new Error(r.message || `${url}: HTTP 403`);
+            }
+            const result = await res.json().catch(() => null);
+            if (!res.ok || !result) throw new Error(result?.message || `${url}: HTTP ${res.status}`);
+            if (result.status !== 'success') throw new Error(`${url}: ${result.message}`);
+            return result;
+        }
+
+        // Datos de la sesión que entrega el servidor: nombre, rol, permisos y token CSRF
+        const APP_SESION = <?= json_encode($sesionCliente, JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT | JSON_UNESCAPED_UNICODE) ?>;
+
+        function tienePermiso(permiso) {
+            return APP_SESION.permisos.includes(permiso);
+        }
+
+        // Envía una acción a la API con el token CSRF en la cabecera
+        function postJson(url, datos) {
+            return fetchJson(url, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': APP_SESION.csrf },
+                body: JSON.stringify(datos)
+            });
+        }
+
+        // =====================================================================
+        // FUNCIÓN: fetchAppData
+        // Devuelve catálogos e historial. Las pantallas comparten la misma respuesta
+        // durante APP_DATA_TTL_MS para no descargar todo el historial en cada cambio.
+        // =====================================================================
+        const APP_DATA_TTL_MS = 60000;
+        let appDataPromise = null;
+        let appDataTime    = 0;
+
+        function fetchAppData() {
+            if (appDataPromise && Date.now() - appDataTime < APP_DATA_TTL_MS) return appDataPromise;
+            appDataTime    = Date.now();
+            appDataPromise = fetchJson('api/leer.php').catch(err => {
+                appDataPromise = null; // un fallo no se guarda: el siguiente intento vuelve a consultar
+                throw err;
+            });
+            return appDataPromise;
         }
 
         // =====================================================================
@@ -558,6 +802,9 @@
         // Dispara la carga de datos específica de cada pantalla.
         // =====================================================================
         function loadScreen(screenId) {
+            activeScreen = screenId;
+            document.body.classList.toggle('report-active', screenId === 'report');
+
             // Oculta todas las pantallas y desactiva todos los ítems del sidebar
             document.querySelectorAll('.screen-content').forEach(s => s.classList.remove('active'));
             document.querySelectorAll('.sidebar-item').forEach(i => i.classList.remove('active'));
@@ -576,6 +823,8 @@
             // Carga datos según la pantalla
             if (screenId === 'dashboard') loadCatalogs();
             if (screenId === 'history')   fetchFullHistory();
+            if (screenId === 'report')    loadReportScreen();
+            if (screenId === 'admin')     loadAdminScreen();
         }
 
         // =====================================================================
@@ -586,33 +835,34 @@
         // =====================================================================
         async function loadCatalogs() {
             try {
-                const res    = await fetch('api/leer.php');
-                const result = await res.json();
-                if (result.status === 'success') {
-                    // Llena los <select> con los catálogos
-                    populateSelect('especie', result.data.species, 'nombre');
-                    populateSelect('talla',   result.data.tallas,  'rango');
-                    barcosData    = result.data.barcos;
+                const result = await fetchAppData();
+                hideAppError('datos');
 
-                    // Construye el mapa STANDARDS: { talla_id: porcentaje }
-                    // estandar en BD está en decimal (0.44), se convierte a porcentaje (44.0)
-                    STANDARDS = {};
-                    result.data.tallas.forEach(t => {
-                        STANDARDS[t.id] = parseFloat((t.estandar * 100).toFixed(2));
-                    });
+                // Llena los <select> con los catálogos
+                populateSelect('especie', result.data.species, 'nombre');
+                populateSelect('talla',   result.data.tallas,  'rango');
+                barcosData    = result.data.barcos;
 
-                    // Guarda el historial y conteos globalmente para otras funciones
-                    globalHistoryData = result.data.history;
-                    globalTallaCounts = result.data.tallaCounts ?? [];
+                // Construye el mapa STANDARDS: { talla_id: porcentaje }
+                // estandar en BD está en decimal (0.44), se convierte a porcentaje (44.0)
+                STANDARDS = {};
+                result.data.tallas.forEach(t => {
+                    STANDARDS[t.id] = parseFloat((t.estandar * 100).toFixed(2));
+                });
+
+                // Guarda el historial y conteos globalmente para otras funciones
+                globalHistoryData = result.data.history;
+                globalTallaCounts = result.data.tallaCounts ?? [];
 
 
-                    // Sincroniza la Proyección de Recuperación con los selectores actuales.
-                    // Necesario porque populateSelect resetea los selects a la primera opción,
-                    // y updateProjection() depende de STANDARDS y globalHistoryData que
-                    // se acaban de construir en este mismo bloque.
-                    updateProjection();
-                }
-            } catch (err) {}
+                // Sincroniza la Proyección de Recuperación con los selectores actuales.
+                // Necesario porque populateSelect resetea los selects a la primera opción,
+                // y updateProjection() depende de STANDARDS y globalHistoryData que
+                // se acaban de construir en este mismo bloque.
+                updateProjection();
+            } catch (err) {
+                showAppError('No se pudieron cargar los datos. Lo que ves puede estar vacío o desactualizado.', err, 'datos');
+            }
         }
 
         // =====================================================================
@@ -644,11 +894,18 @@
         // Timer para el debounce del input de compra — evita requests en cada tecla
         let compraSearchTimer = null;
 
+        // Muestra bajo el campo si la compra existe en esta base; sin texto lo oculta
+        function setCompraStatus(text, found) {
+            const el = document.getElementById('compraStatus');
+            el.innerText = text;
+            el.className = !text ? 'hidden' : `text-xs font-bold ${found ? 'text-emerald-600' : 'text-rose-600'}`;
+        }
+
         // =====================================================================
         // EVENTO: input en campo "compra"
         // Al escribir el código de compra:
         //   1. Fuerza mayúsculas
-        //   2. Con 5+ chars detecta el barco (chars 2-4 = abreviatura, ej. "ISY")
+        //   2. Con 5+ chars detecta el barco (chars 2-4 = abreviatura, ej. "SY1")
         //   3. Con 7+ chars dispara lookupCompra() tras 300ms de inactividad
         //   4. Al borrar, restaura los KPIs globales
         //   5. Siempre recalcula la proyección de recuperación
@@ -660,7 +917,7 @@
 
             if (val.length >= 5) {
                 // Extrae la abreviatura del barco desde la posición 2 (índice 0-based)
-                // Ej: "TISY12455" → abrev = "ISY"
+                // Ej: "TISY12455" → abrev = "SY1"
                 const abrev = val.substring(2, 5);
                 const barco = barcosData.find(b => b.abreviatura === abrev);
                 barcoInput.value = barco ? barco.nombre : 'Barco no reconocido';
@@ -675,6 +932,7 @@
 
             // Debounce: espera 300ms sin escribir antes de consultar la API
             clearTimeout(compraSearchTimer);
+            setCompraStatus('');
             if (val.length >= 7) {
                 compraSearchTimer = setTimeout(() => lookupCompra(val), 300);
             } else {
@@ -775,10 +1033,10 @@
         // =====================================================================
         async function lookupCompra(compra) {
             try {
-                const res    = await fetch(`api/buscar.php?compra=${encodeURIComponent(compra)}`);
-                const result = await res.json();
+                const result = await fetchJson(`api/buscar.php?compra=${encodeURIComponent(compra)}`);
+                hideAppError('compra');
 
-                if (result.status === 'success' && result.total > 0) {
+                if (result.total > 0) {
                     const rows   = result.data;
 
                     // Guarda los registros de la compra para que updateProjection()
@@ -803,6 +1061,7 @@
                     document.getElementById('kpiPonderado').innerText   = pond + '%';
                     document.getElementById('kpiAlertas').innerText     = alerts;
                     document.getElementById('kpiVolumen').innerText     = totalR;
+                    setCompraStatus(`${totalR} ${totalR === 1 ? 'partida encontrada' : 'partidas encontradas'} en esta base de datos.`, true);
 
                     // Actualiza la proyección con contexto de compra (usa compraHistoryData)
                     updateProjection();
@@ -811,11 +1070,13 @@
                     compraHistoryData = null;
                     showGlobalKPIs();
                     updateProjection();
+                    setCompraStatus('Esta compra no existe en esta base de datos. Los indicadores muestran los totales globales.', false);
                 }
             } catch (err) {
                 compraHistoryData = null;
                 showGlobalKPIs();
                 updateProjection();
+                showAppError(`No se pudo consultar la compra ${compra}. Los indicadores muestran los totales globales.`, err, 'compra');
             }
         }
 
@@ -1118,15 +1379,16 @@
         //   1. Obtiene todo el historial de la API
         //   2. Renderiza las filas de la Matriz en orden inverso (más reciente primero)
         //   3. Actualiza los KPIs con totales globales
-        //   4. Inicializa la gráfica histórica en modo agregado
+        //   4. Inicializa la gráfica histórica respetando el filtro activo
         // =====================================================================
         async function fetchFullHistory() {
-            const tableBody = document.getElementById('tableBody');
             try {
-                const res    = await fetch('api/leer.php');
-                const result = await res.json();
+                const result = await fetchAppData();
+                hideAppError('datos');
 
-                if (result.status === 'success' && result.data.history.length > 0) {
+                if (result.data.history.length === 0) {
+                    renderMatrixRows([]);
+                } else {
                     globalHistoryData = result.data.history;
 
                     // La tabla muestra del más reciente al más antiguo (reverse)
@@ -1148,16 +1410,19 @@
                     populateFilters(globalHistoryData);
                     populateTemporalFilters(globalHistoryData);
 
-                    // Vista inicial: historial completo agregado por compra
-                    initTraceabilityChart(globalHistoryData);
+                    // Vista inicial: historial agregado por compra, o el filtro que ya esté escrito
+                    applyChartFilters();
                 }
-            } catch (err) {}
+            } catch (err) {
+                showAppError('No se pudo cargar el historial. Lo que ves puede estar vacío o desactualizado.', err, 'datos');
+            }
         }
 
         // =====================================================================
-        // FUNCIÓN: renderMatrixRows
-        // Genera dinámicamente las filas <tr> de la Matriz de Trazabilidad.
-        // Cada fila incluye data-compra para que filterMatrix() pueda ocultarla/mostrarla.
+        // FUNCIÓN: renderMatrixRows / refreshMatrix / appendMatrixRows
+        // Genera las filas <tr> de la Matriz de Trazabilidad por bloques: la página
+        // solo contiene las filas que se han visto, y al bajar con el scroll se
+        // agregan más. El filtro trabaja sobre los datos, no sobre la página.
         //
         // Campos mostrados:
         //   - Fecha (solo la parte de fecha, sin hora)
@@ -1167,10 +1432,35 @@
         //   - Cumplimiento: rendimiento / estándar de la talla × 100
         //   - Badge de status: "Alerta" (rojo) u "Óptimo" (verde)
         // =====================================================================
+        const MATRIX_PAGE_SIZE = 100;
+        let matrixRows     = []; // todas las filas, de la más reciente a la más antigua
+        let matrixFiltered = []; // las que cumplen el filtro activo
+        let matrixShown    = 0;  // cuántas de matrixFiltered ya están en la página
+
         function renderMatrixRows(rows) {
+            matrixRows = rows;
+            refreshMatrix(document.getElementById('filterCompra').value);
+        }
+
+        function refreshMatrix(text) {
+            const filter = text.trim().toUpperCase();
+            matrixFiltered = filter ? matrixRows.filter(r => r.compra.includes(filter)) : matrixRows;
+            matrixShown = 0;
+            document.getElementById('matrixScroll').scrollTop = 0;
+
             const tableBody = document.getElementById('tableBody');
             tableBody.innerHTML = '';
-            rows.forEach(row => {
+            if (matrixFiltered.length === 0) {
+                tableBody.innerHTML = '<tr><td colspan="6" class="py-8 text-center text-slate-400 font-bold">Sin registros para mostrar</td></tr>';
+            } else {
+                appendMatrixRows(MATRIX_PAGE_SIZE);
+            }
+            updateMatrixCount();
+        }
+
+        function appendMatrixRows(count) {
+            const fragment = document.createDocumentFragment();
+            matrixFiltered.slice(matrixShown, matrixShown + count).forEach(row => {
                 const rend   = (row.rendimiento_esperado * 100).toFixed(1);
                 // estandar puede ser null si la talla no tiene estándar definido
                 const cumpl  = row.estandar
@@ -1179,15 +1469,12 @@
                 const isAlert = row.alerta_status == 1;
                 const tr = document.createElement('tr');
                 tr.className = "border-b border-slate-100 hover:bg-slate-50";
-                tr.dataset.compra  = row.compra;
-                tr.dataset.especie = row.especie_nombre;
-                tr.dataset.talla   = row.talla_rango;
                 tr.innerHTML = `
-                    <td class="py-2 px-4 text-slate-500 font-medium">${row.fecha_registro.split(' ')[0]}</td>
-                    <td class="py-2 px-4 font-bold text-slate-800">${row.compra}</td>
+                    <td class="py-2 px-4 text-slate-500 font-medium">${escapeHtml(row.fecha_registro.split(' ')[0])}</td>
+                    <td class="py-2 px-4 font-bold text-slate-800">${escapeHtml(row.compra)}</td>
                     <td class="py-2 px-4 font-medium text-slate-700">
-                        ${row.especie_nombre}
-                        <span class="ml-1 text-xs font-bold text-slate-400">${row.talla_rango}</span>
+                        ${escapeHtml(row.especie_nombre)}
+                        <span class="ml-1 text-xs font-bold text-slate-400">${escapeHtml(row.talla_rango)}</span>
                     </td>
                     <td class="py-2 px-4 text-right font-black" style="color:${isAlert ? '#E11D48' : '#10B981'}">${rend}%</td>
                     <td class="py-2 px-4 text-right text-slate-500 font-bold">${cumpl}%</td>
@@ -1197,10 +1484,22 @@
                         </span>
                     </td>
                 `;
-                tableBody.appendChild(tr);
+                fragment.appendChild(tr);
             });
-            updateMatrixCount();
+            document.getElementById('tableBody').appendChild(fragment);
+            matrixShown = Math.min(matrixShown + count, matrixFiltered.length);
         }
+
+        // Agrega el siguiente bloque al acercarse al final de la tabla
+        document.getElementById('matrixScroll').addEventListener('scroll', function () {
+            const nearEnd = this.scrollTop + this.clientHeight >= this.scrollHeight - 200;
+            if (nearEnd && matrixShown < matrixFiltered.length) appendMatrixRows(MATRIX_PAGE_SIZE);
+        });
+
+        // Al imprimir, la tabla sale completa aunque no se haya recorrido con el scroll
+        window.addEventListener('beforeprint', () => {
+            if (activeScreen !== 'report') appendMatrixRows(matrixFiltered.length - matrixShown);
+        });
 
         // =====================================================================
         // FUNCIÓN: populateFilters
@@ -1301,13 +1600,16 @@
         // FUNCIÓN: filterMatrix
         // Filtra las filas de la Matriz por código de compra en tiempo real.
         // =====================================================================
+        let matrixFilterTimer = null;
+
+        // Espera a que se deje de escribir: cada filtrado también redibuja la gráfica
+        function onMatrixFilterInput(text) {
+            clearTimeout(matrixFilterTimer);
+            matrixFilterTimer = setTimeout(() => filterMatrix(text), 200);
+        }
+
         function filterMatrix(text) {
-            const filter = text.trim().toUpperCase();
-            const rows   = document.querySelectorAll('#tableBody tr');
-            rows.forEach(tr => {
-                tr.style.display = (!filter || tr.dataset.compra.includes(filter)) ? '' : 'none';
-            });
-            updateMatrixCount();
+            refreshMatrix(text);
             applyChartFilters();
 
             document.getElementById('forecastWrapper').classList.add('hidden');
@@ -1325,10 +1627,10 @@
         // Muestra "N registros" si no hay filtro, o "X / N" si hay filtro activo.
         // =====================================================================
         function updateMatrixCount() {
-            const all     = document.querySelectorAll('#tableBody tr');
-            const visible = [...all].filter(tr => tr.style.display !== 'none').length;
+            const total   = matrixRows.length;
+            const visible = matrixFiltered.length;
             const el = document.getElementById('matrixCount');
-            if (el) el.innerText = visible === all.length ? `${all.length} registros` : `${visible} / ${all.length}`;
+            if (el) el.innerText = visible === total ? `${total} registros` : `${visible} / ${total}`;
         }
 
         // =====================================================================
@@ -1537,6 +1839,514 @@
         ['temporalBarco', 'temporalAnio', 'temporalMes'].forEach(id => {
             document.getElementById(id).addEventListener('change', applyTemporalFilters);
         });
+
+        // =====================================================================
+        // REPORTE AUTOMATIZADO
+        // Todo se calcula con reglas fijas sobre el historial: el mismo dato siempre
+        // da el mismo resultado y se puede auditar.
+        //
+        // Criterio: cumplimiento = rendimiento promedio / estándar promedio × 100,
+        // donde cada partida pesa lo mismo. No se pondera por kilos porque casi
+        // ninguna partida tiene peso registrado.
+        // =====================================================================
+        const REPORT_MIN_PARTIDAS = 5; // menos partidas no compiten en el ranking
+        const REPORT_TOP          = 5;
+
+        // true desde el primer clic en generar: al volver a la pantalla se recalcula
+        let reportRequested = false;
+
+        function escapeHtml(value) {
+            const map = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
+            return String(value ?? '').replace(/[&<>"']/g, c => map[c]);
+        }
+
+        // Solo se puede comparar una partida con rendimiento y con estándar definido
+        function reportValidRows(history) {
+            return history.filter(r => Number.isFinite(parseFloat(r.rendimiento_esperado)) && parseFloat(r.estandar) > 0);
+        }
+
+        function summarizeRows(rows) {
+            let sumRend = 0, sumStd = 0, alertas = 0;
+            rows.forEach(r => {
+                sumRend += parseFloat(r.rendimiento_esperado);
+                sumStd  += parseFloat(r.estandar);
+                if (r.alerta_status == 1) alertas++;
+            });
+            const n = rows.length;
+            return {
+                partidas: n,
+                rendimiento: sumRend / n * 100,
+                estandar: sumStd / n * 100,
+                cumplimiento: sumRend / sumStd * 100,
+                diferencia: (sumRend - sumStd) / n * 100, // puntos porcentuales sobre el estándar
+                alertas
+            };
+        }
+
+        function groupRows(rows, keyOf) {
+            const groups = new Map();
+            rows.forEach(r => {
+                const key = keyOf(r);
+                if (!groups.has(key)) groups.set(key, []);
+                groups.get(key).push(r);
+            });
+            return groups;
+        }
+
+        function barcoDeCompra(compra, barcos) {
+            const abrev = compra.substring(2, 5);
+            return barcos.find(b => b.abreviatura === abrev)?.nombre ?? 'Barco no reconocido';
+        }
+
+        // Una fila por compra, de mayor a menor cumplimiento
+        function buildCompraSummaries(rows, barcos) {
+            const list = [];
+            groupRows(rows, r => r.compra).forEach((items, compra) => {
+                const fechas = items.map(r => r.fecha_registro).sort();
+                list.push({
+                    compra,
+                    barco: barcoDeCompra(compra, barcos),
+                    desde: fechas[0].split(' ')[0],
+                    hasta: fechas[fechas.length - 1].split(' ')[0],
+                    ...summarizeRows(items)
+                });
+            });
+            return list.sort((a, b) => b.cumplimiento - a.cumplimiento || a.compra.localeCompare(b.compra));
+        }
+
+        // "1.3 puntos por debajo de", "0.4 puntos arriba" o el texto de igualdad, según el signo
+        function describeDiff(puntos, arriba, abajo, igual) {
+            const valor = parseFloat(puntos.toFixed(1));
+            if (valor === 0) return igual;
+            return `${Math.abs(valor).toFixed(1)} puntos ${valor > 0 ? arriba : abajo}`;
+        }
+
+        function statusBadge(s) {
+            return s.cumplimiento >= 100
+                ? '<span class="px-2 py-1 rounded text-[10px] font-bold uppercase bg-emerald-100 text-emerald-600">Cumple</span>'
+                : '<span class="px-2 py-1 rounded text-[10px] font-bold uppercase bg-rose-100 text-rose-600">Bajo estándar</span>';
+        }
+
+        function reportKpi(label, value) {
+            return `<div class="bg-slate-50 rounded-lg p-4">
+                        <p class="text-[10px] font-bold text-slate-400 uppercase mb-1">${label}</p>
+                        <p class="text-2xl font-extrabold text-slate-800">${value}</p>
+                    </div>`;
+        }
+
+        // Resumen ejecutivo: conclusión en texto, indicadores y detalle por especie/talla
+        function renderCompraReport(compra, valid, barcos) {
+            const section = document.getElementById('reportCompraSection');
+            const rows = valid.filter(r => r.compra === compra);
+            if (rows.length === 0) {
+                section.innerHTML = `<div class="card-pro p-8 text-center font-bold text-rose-500">No se encontró la compra ${escapeHtml(compra)} en el historial.</div>`;
+                return;
+            }
+
+            const s = buildCompraSummaries(rows, barcos)[0];
+            const groups = [];
+            groupRows(rows, r => `${r.especie_nombre} ${r.talla_rango}`).forEach((items, nombre) => {
+                groups.push({ nombre, ...summarizeRows(items) });
+            });
+            // Lo que más pesó sobre el resultado: diferencia con el estándar × partidas
+            groups.sort((a, b) => a.diferencia * a.partidas - b.diferencia * b.partidas);
+            const peor  = groups[0];
+            const mejor = groups[groups.length - 1];
+
+            const sentences = [
+                `Rindió ${s.rendimiento.toFixed(1)}%, ${describeDiff(s.diferencia, 'por encima de', 'por debajo de', 'igual a')} su estándar de ${s.estandar.toFixed(1)}% (cumplimiento de ${s.cumplimiento.toFixed(1)}%).`,
+                `${s.alertas} de ${s.partidas} ${s.partidas === 1 ? 'partida quedó' : 'partidas quedaron'} en alerta.`
+            ];
+
+            // El lugar en el ranking es información comparativa: solo para roles con ese permiso
+            const ranking = buildCompraSummaries(valid, barcos).filter(c => c.partidas >= REPORT_MIN_PARTIDAS);
+            const lugar   = ranking.findIndex(c => c.compra === compra);
+            if (lugar < 0) {
+                sentences.push(`Tiene menos de ${REPORT_MIN_PARTIDAS} partidas: su resultado debe leerse con cautela.`);
+            } else if (tienePermiso('ver_ranking')) {
+                sentences.push(`Ocupa el lugar ${lugar + 1} de ${ranking.length} compras comparables del historial.`);
+            }
+
+            const abrev  = compra.substring(2, 5);
+            const otras  = valid.filter(r => r.compra !== compra);
+            const barco  = otras.filter(r => r.compra.substring(2, 5) === abrev);
+            if (barco.length > 0) {
+                const diff = s.cumplimiento - summarizeRows(barco).cumplimiento;
+                sentences.push(`Frente a las demás compras de ${s.barco}, su cumplimiento está ${describeDiff(diff, 'arriba', 'abajo', 'igual')}.`);
+            }
+            if (peor.diferencia < 0) sentences.push(`Lo que más la bajó: ${peor.nombre} (cumplimiento de ${peor.cumplimiento.toFixed(1)}%).`);
+            if (mejor.diferencia > 0) sentences.push(`Lo que más la subió: ${mejor.nombre} (cumplimiento de ${mejor.cumplimiento.toFixed(1)}%).`);
+
+            const diffGlobal = otras.length > 0 ? s.cumplimiento - summarizeRows(otras).cumplimiento : null;
+            const fechas = s.desde === s.hasta ? s.desde : `${s.desde} a ${s.hasta}`;
+
+            section.innerHTML = `
+                <div class="card-pro p-8 space-y-6">
+                    <div class="flex flex-wrap justify-between items-start gap-4 border-b border-slate-100 pb-4">
+                        <div>
+                            <p class="text-xs font-bold text-slate-400 uppercase mb-1">Resumen ejecutivo de la compra</p>
+                            <h3 id="reportTitulo" class="text-2xl font-extrabold text-slate-900">${escapeHtml(s.compra)}</h3>
+                            <p class="text-sm font-bold text-slate-500">${escapeHtml(s.barco)} · ${fechas}</p>
+                        </div>
+                        ${statusBadge(s)}
+                    </div>
+                    <p id="reportConclusion" class="text-base text-slate-700 leading-relaxed">${sentences.map(escapeHtml).join(' ')}</p>
+                    <div class="grid grid-cols-2 md:grid-cols-5 gap-4">
+                        ${reportKpi('Rendimiento', s.rendimiento.toFixed(1) + '%')}
+                        ${reportKpi('Estándar', s.estandar.toFixed(1) + '%')}
+                        ${reportKpi('Cumplimiento', s.cumplimiento.toFixed(1) + '%')}
+                        ${reportKpi('Alertas', `${s.alertas} / ${s.partidas}`)}
+                        ${reportKpi('Frente al resto', diffGlobal === null ? '--' : `${diffGlobal >= 0 ? '+' : ''}${diffGlobal.toFixed(1)} pts`)}
+                    </div>
+                    <div class="overflow-x-auto">
+                        <table class="w-full text-left border-collapse min-w-[600px]">
+                            <thead class="bg-slate-50 text-[10px] font-bold text-slate-400 uppercase">
+                                <tr>
+                                    <th class="py-3 px-4">Especie / Talla</th>
+                                    <th class="py-3 px-4 text-right">Partidas</th>
+                                    <th class="py-3 px-4 text-right">Rendimiento</th>
+                                    <th class="py-3 px-4 text-right">Estándar</th>
+                                    <th class="py-3 px-4 text-right">Cumplimiento</th>
+                                    <th class="py-3 px-4 text-right">Alertas</th>
+                                </tr>
+                            </thead>
+                            <tbody id="reportDetalle" class="text-sm">
+                                ${groups.map(g => `
+                                <tr class="border-b border-slate-100">
+                                    <td class="py-2 px-4 font-bold text-slate-700">${escapeHtml(g.nombre)}</td>
+                                    <td class="py-2 px-4 text-right">${g.partidas}</td>
+                                    <td class="py-2 px-4 text-right">${g.rendimiento.toFixed(1)}%</td>
+                                    <td class="py-2 px-4 text-right">${g.estandar.toFixed(1)}%</td>
+                                    <td class="py-2 px-4 text-right font-black" style="color:${g.cumplimiento >= 100 ? '#10B981' : '#E11D48'}">${g.cumplimiento.toFixed(1)}%</td>
+                                    <td class="py-2 px-4 text-right">${g.alertas}</td>
+                                </tr>`).join('')}
+                            </tbody>
+                        </table>
+                    </div>
+                </div>`;
+        }
+
+        function rankingTable(id, title, icon, list) {
+            return `
+                <div class="card-pro p-8">
+                    <h3 class="text-lg font-bold text-slate-800 mb-4"><i class="fas ${icon}"></i> ${title}</h3>
+                    <div class="overflow-x-auto">
+                        <table class="w-full text-left border-collapse min-w-[700px]">
+                            <thead class="bg-slate-50 text-[10px] font-bold text-slate-400 uppercase">
+                                <tr>
+                                    <th class="py-3 px-4">Compra</th>
+                                    <th class="py-3 px-4">Barco</th>
+                                    <th class="py-3 px-4">Fecha</th>
+                                    <th class="py-3 px-4 text-right">Partidas</th>
+                                    <th class="py-3 px-4 text-right">Rendimiento</th>
+                                    <th class="py-3 px-4 text-right">Estándar</th>
+                                    <th class="py-3 px-4 text-right">Cumplimiento</th>
+                                    <th class="py-3 px-4 text-center">Status</th>
+                                </tr>
+                            </thead>
+                            <tbody id="${id}" class="text-sm">
+                                ${list.map(c => `
+                                <tr class="border-b border-slate-100">
+                                    <td class="py-2 px-4 font-bold"><a href="#" class="text-primary hover:underline" data-report-compra="${escapeHtml(c.compra)}">${escapeHtml(c.compra)}</a></td>
+                                    <td class="py-2 px-4 text-slate-600">${escapeHtml(c.barco)}</td>
+                                    <td class="py-2 px-4 text-slate-500">${c.desde}</td>
+                                    <td class="py-2 px-4 text-right">${c.partidas}</td>
+                                    <td class="py-2 px-4 text-right">${c.rendimiento.toFixed(1)}%</td>
+                                    <td class="py-2 px-4 text-right">${c.estandar.toFixed(1)}%</td>
+                                    <td class="py-2 px-4 text-right font-black" style="color:${c.cumplimiento >= 100 ? '#10B981' : '#E11D48'}">${c.cumplimiento.toFixed(1)}%</td>
+                                    <td class="py-2 px-4 text-center">${statusBadge(c)}</td>
+                                </tr>`).join('')}
+                            </tbody>
+                        </table>
+                    </div>
+                </div>`;
+        }
+
+        // Resumen del periodo y mejores/peores compras, sin repetir ninguna entre las dos listas
+        function renderPeriodoReport(periodo, valid, barcos) {
+            const section = document.getElementById('reportPeriodoSection');
+            const rows = periodo ? valid.filter(r => r.fecha_registro.startsWith(periodo)) : valid;
+            const label = periodo || 'todo el historial';
+            if (rows.length === 0) {
+                section.innerHTML = `<div class="card-pro p-8 text-center font-bold text-slate-400">No hay partidas en ${escapeHtml(label)}.</div>`;
+                return;
+            }
+
+            const compras  = buildCompraSummaries(rows, barcos);
+            const elegibles = compras.filter(c => c.partidas >= REPORT_MIN_PARTIDAS);
+            const total    = summarizeRows(rows);
+            const bajo     = compras.filter(c => c.cumplimiento < 100).length;
+            const n        = Math.min(REPORT_TOP, Math.floor(elegibles.length / 2));
+
+            // Mejores y peores compras: solo para roles con permiso de ver el ranking
+            const verRanking = tienePermiso('ver_ranking');
+            let rankings = !verRanking ? '' : `<div class="card-pro p-8 text-center font-bold text-slate-400">No hay suficientes compras con ${REPORT_MIN_PARTIDAS} partidas o más para comparar.</div>`;
+            if (verRanking && n > 0) {
+                rankings = rankingTable('reportMejores', 'Compras con mejor cumplimiento', 'fa-arrow-up text-emerald-500', elegibles.slice(0, n))
+                         + rankingTable('reportPeores', 'Compras a revisar', 'fa-arrow-down text-rose-500', elegibles.slice(-n).reverse());
+            }
+
+            section.innerHTML = `
+                <div class="space-y-8">
+                    <div class="card-pro p-8">
+                        <p class="text-xs font-bold text-slate-400 uppercase mb-4">Resumen de ${escapeHtml(label)}</p>
+                        <div id="reportPeriodoKpis" class="grid grid-cols-2 md:grid-cols-4 gap-4">
+                            ${reportKpi('Compras', compras.length)}
+                            ${reportKpi('Partidas', total.partidas)}
+                            ${reportKpi('Cumplimiento', total.cumplimiento.toFixed(1) + '%')}
+                            ${reportKpi('Compras bajo estándar', `${bajo} / ${compras.length}`)}
+                        </div>
+                        ${!verRanking ? '' : `<p class="text-xs text-slate-400 font-bold mt-4">
+                            El ranking compara ${elegibles.length} compras con ${REPORT_MIN_PARTIDAS} partidas o más; ${compras.length - elegibles.length} quedan fuera por tener muy pocas.
+                        </p>`}
+                    </div>
+                    ${rankings}
+                </div>`;
+        }
+
+        // Llena el selector de periodo con los años del historial, conservando la selección
+        function populateReportYears(history) {
+            const select = document.getElementById('reportPeriodo');
+            const actual = select.value;
+            const years  = [...new Set(history.map(r => r.fecha_registro.slice(0, 4)))].sort().reverse();
+            select.innerHTML = '<option value="">Todo el historial</option>';
+            years.forEach(y => {
+                const o = document.createElement('option'); o.value = y; o.textContent = y;
+                select.appendChild(o);
+            });
+            select.value = years.includes(actual) ? actual : '';
+        }
+
+        // =====================================================================
+        // FUNCIÓN: generateReport
+        // Lee los controles y dibuja el reporte con los datos ya cargados.
+        // =====================================================================
+        function generateReport(result) {
+            const history = result.data.history;
+            const barcos  = result.data.barcos;
+            const valid   = reportValidRows(history);
+            const input   = document.getElementById('reportCompra');
+            const compra  = input.value.trim().toUpperCase();
+            input.value   = compra;
+
+            if (compra) {
+                renderCompraReport(compra, valid, barcos);
+            } else {
+                document.getElementById('reportCompraSection').innerHTML = '';
+            }
+            renderPeriodoReport(document.getElementById('reportPeriodo').value, valid, barcos);
+
+            const omitidas = history.length - valid.length;
+            document.getElementById('reportMeta').innerText =
+                `Generado el ${new Date().toLocaleString('es-GT')} con ${valid.length} partidas. `
+                + 'Cumplimiento calculado por partida, sin ponderar por kilos.'
+                + (omitidas === 1 ? ' 1 partida sin estándar quedó fuera.' : '')
+                + (omitidas > 1 ? ` ${omitidas} partidas sin estándar quedaron fuera.` : '');
+
+            document.getElementById('reportEmpty').classList.add('hidden');
+            document.getElementById('reportContent').classList.remove('hidden');
+        }
+
+        async function loadReportScreen() {
+            try {
+                const result = await fetchAppData();
+                hideAppError('datos');
+                populateReportYears(result.data.history);
+                if (reportRequested) generateReport(result);
+            } catch (err) {
+                showAppError('No se pudieron cargar los datos del reporte. Lo que ves puede estar vacío o desactualizado.', err, 'datos');
+            }
+        }
+
+        function requestReport() {
+            reportRequested = true;
+            loadReportScreen();
+        }
+
+        // Botón del Dashboard: abre el reporte de la compra que esté escrita
+        function goToReport() {
+            document.getElementById('reportCompra').value = document.getElementById('compra').value;
+            reportRequested = true;
+            loadScreen('report');
+        }
+
+        // Clic en una compra de los rankings: abre su resumen ejecutivo
+        document.getElementById('reportContent').addEventListener('click', e => {
+            const link = e.target.closest('[data-report-compra]');
+            if (!link) return;
+            e.preventDefault();
+            document.getElementById('reportCompra').value = link.dataset.reportCompra;
+            requestReport();
+            document.querySelector('main').scrollTop = 0;
+        });
+
+        // =====================================================================
+        // ADMINISTRACIÓN
+        // Cada sección existe en la página solo si el rol tiene el permiso, y la
+        // API lo vuelve a comprobar: ocultar un botón no es lo que protege.
+        // =====================================================================
+        const EVENTOS = {
+            login_ok: 'Ingreso', login_fallido: 'Ingreso fallido', login_bloqueado: 'Intento con cuenta bloqueada',
+            cuenta_bloqueada: 'Cuenta bloqueada', ip_bloqueada: 'IP bloqueada', captcha_fallido: 'Captcha incorrecto',
+            logout: 'Cierre de sesión', sesion_expirada: 'Sesión expirada', sesion_revocada: 'Sesión revocada',
+            cambio_clave: 'Cambio de contraseña', cambio_clave_fallido: 'Cambio de contraseña fallido',
+            usuario_creado: 'Cuenta creada', usuario_editado: 'Cuenta editada', usuario_activado: 'Cuenta activada',
+            usuario_desactivado: 'Cuenta desactivada', clave_restablecida: 'Contraseña restablecida',
+            acceso_denegado: 'Acceso denegado', sync_reactivada: 'Sincronización reactivada'
+        };
+
+        function loadAdminScreen() {
+            if (document.getElementById('adminSync'))     loadAdminSync();
+            if (document.getElementById('adminUsuarios')) loadAdminUsuarios();
+            if (document.getElementById('adminBitacora')) loadAdminBitacora();
+        }
+
+        function adminError(err) {
+            showAppError(`No se pudo completar la acción: ${err.message}`, err, 'admin');
+        }
+
+        async function loadAdminSync() {
+            const caja = document.getElementById('adminSync');
+            const btn  = document.getElementById('btnReactivar');
+            try {
+                const r = await fetchJson('api/sincronizacion.php');
+                if (!r.disponible) {
+                    caja.innerHTML = 'Esta instancia todavía no recibe datos de la sincronización.';
+                    btn.classList.add('hidden');
+                    return;
+                }
+                const detenido = r.estado.some(e => e.detenido == 1);
+                btn.classList.toggle('hidden', !(detenido && r.puedeReactivar));
+                const estado = r.estado.map(e => `
+                    <p class="font-bold ${e.detenido == 1 ? 'text-rose-600' : 'text-emerald-600'}">
+                        Modo ${escapeHtml(e.modo)}: ${e.detenido == 1 ? 'DETENIDA · ' + escapeHtml(e.motivo) : 'activa'}
+                        <span class="text-slate-400 font-medium">· copiado hasta ${escapeHtml(e.ultima_fecha ?? '-')}</span>
+                    </p>`).join('');
+                const filas = r.ejecuciones.map(e => `
+                    <tr class="border-b border-slate-100">
+                        <td class="py-2 px-4">${escapeHtml(e.inicio)}</td>
+                        <td class="py-2 px-4 font-bold ${e.estado === 'ok' ? 'text-emerald-600' : 'text-rose-600'}">${escapeHtml(e.estado)}</td>
+                        <td class="py-2 px-4 text-right">${escapeHtml(String(e.leidas ?? 0))}</td>
+                        <td class="py-2 px-4 text-right">${escapeHtml(String(e.insertadas ?? 0))}</td>
+                        <td class="py-2 px-4 text-right">${escapeHtml(String(e.actualizadas ?? 0))}</td>
+                        <td class="py-2 px-4 text-right">${escapeHtml(String(e.segundos ?? '-'))}</td>
+                        <td class="py-2 px-4 text-slate-500">${escapeHtml(e.mensaje ?? '')}</td>
+                    </tr>`).join('');
+                caja.innerHTML = `${estado || '<p>Sin estado registrado.</p>'}
+                    <div class="overflow-x-auto mt-4">
+                        <table class="w-full text-left border-collapse min-w-[700px]">
+                            <thead class="bg-slate-50 text-[10px] font-bold text-slate-400 uppercase">
+                                <tr><th class="py-3 px-4">Inicio</th><th class="py-3 px-4">Estado</th><th class="py-3 px-4 text-right">Leídas</th>
+                                    <th class="py-3 px-4 text-right">Nuevas</th><th class="py-3 px-4 text-right">Actualizadas</th>
+                                    <th class="py-3 px-4 text-right">Segundos</th><th class="py-3 px-4">Mensaje</th></tr>
+                            </thead>
+                            <tbody>${filas}</tbody>
+                        </table>
+                    </div>`;
+            } catch (err) {
+                caja.textContent = 'No se pudo consultar la sincronización.';
+                adminError(err);
+            }
+        }
+
+        async function reactivarSincronizacion() {
+            if (!confirm('¿Reactivar la sincronización? Volverá a intentar en el próximo horario programado.')) return;
+            try {
+                await postJson('api/sincronizacion.php', { accion: 'reactivar' });
+                loadAdminSync();
+                if (document.getElementById('adminBitacora')) loadAdminBitacora();
+            } catch (err) { adminError(err); }
+        }
+
+        async function loadAdminUsuarios() {
+            try {
+                const r = await fetchJson('api/usuarios.php');
+                document.getElementById('adminUsuarios').innerHTML = r.data.map(u => {
+                    const estado = u.activo != 1 ? '<span class="text-slate-400">Desactivada</span>'
+                                 : u.bloqueado == 1 ? '<span class="text-rose-600">Bloqueada</span>'
+                                 : u.debe_cambiar_clave == 1 ? '<span class="text-amber-600">Contraseña temporal</span>'
+                                 : '<span class="text-emerald-600">Activa</span>';
+                    const opciones = Object.entries(r.roles).map(([valor, nombre]) =>
+                        `<option value="${escapeHtml(valor)}" ${valor === u.rol ? 'selected' : ''}>${escapeHtml(nombre)}</option>`).join('');
+                    const esYo = u.usuario === APP_SESION.usuario;
+                    return `
+                    <tr class="border-b border-slate-100" data-id="${Number(u.id)}">
+                        <td class="py-2 px-4 font-bold text-slate-800">${escapeHtml(u.usuario)}${esYo ? ' <span class="text-xs text-primary">(tú)</span>' : ''}</td>
+                        <td class="py-2 px-4"><input class="u-nombre p-1.5 border border-slate-200 rounded text-sm w-48" maxlength="100" value="${escapeHtml(u.nombre)}"></td>
+                        <td class="py-2 px-4"><select class="u-rol p-1.5 border border-slate-200 rounded text-sm">${opciones}</select></td>
+                        <td class="py-2 px-4 font-bold text-xs">${estado}</td>
+                        <td class="py-2 px-4 text-slate-500">${escapeHtml(u.ultimo_acceso ?? 'Nunca')}</td>
+                        <td class="py-2 px-4 text-right whitespace-nowrap">
+                            <button class="u-accion text-xs font-bold text-primary hover:underline" data-accion="editar">Guardar</button>
+                            <button class="u-accion text-xs font-bold text-amber-600 hover:underline ml-3" data-accion="restablecer">Restablecer contraseña</button>
+                            ${esYo ? '' : `<button class="u-accion text-xs font-bold ${u.activo == 1 ? 'text-rose-600' : 'text-emerald-600'} hover:underline ml-3"
+                                data-accion="${u.activo == 1 ? 'desactivar' : 'activar'}">${u.activo == 1 ? 'Desactivar' : 'Activar'}</button>`}
+                        </td>
+                    </tr>`;
+                }).join('');
+            } catch (err) { adminError(err); }
+        }
+
+        // Muestra una contraseña temporal una sola vez, para entregarla en privado
+        function mostrarClaveTemporal(usuario, clave) {
+            const caja = document.getElementById('adminClave');
+            caja.innerHTML = `<strong>Contraseña temporal de ${escapeHtml(usuario)}:</strong>
+                <code class="ml-2 bg-white px-2 py-1 rounded font-bold">${escapeHtml(clave)}</code>
+                <span class="block mt-2 text-xs">Entrégala en privado. No se volverá a mostrar; la persona deberá cambiarla al ingresar.</span>`;
+            caja.classList.remove('hidden');
+        }
+
+        async function crearUsuario(e) {
+            e.preventDefault();
+            try {
+                const r = await postJson('api/usuarios.php', {
+                    accion: 'crear',
+                    usuario: document.getElementById('nuevoUsuario').value,
+                    nombre: document.getElementById('nuevoNombre').value,
+                    rol: document.getElementById('nuevoRol').value
+                });
+                document.getElementById('formUsuario').reset();
+                mostrarClaveTemporal(r.usuario, r.claveTemporal);
+                loadAdminUsuarios();
+                if (document.getElementById('adminBitacora')) loadAdminBitacora();
+            } catch (err) { adminError(err); }
+        }
+
+        if (document.getElementById('adminUsuarios')) {
+            document.getElementById('adminUsuarios').addEventListener('click', async e => {
+                const btn = e.target.closest('.u-accion');
+                if (!btn) return;
+                const fila   = btn.closest('tr');
+                const accion = btn.dataset.accion;
+                const datos  = { accion, id: Number(fila.dataset.id) };
+                if (accion === 'editar') {
+                    datos.nombre = fila.querySelector('.u-nombre').value;
+                    datos.rol    = fila.querySelector('.u-rol').value;
+                }
+                if (accion === 'desactivar' && !confirm('¿Desactivar esta cuenta? Su sesión se cerrará de inmediato.')) return;
+                if (accion === 'restablecer' && !confirm('¿Generar una nueva contraseña temporal para esta cuenta?')) return;
+                try {
+                    const r = await postJson('api/usuarios.php', datos);
+                    if (r.claveTemporal) mostrarClaveTemporal(r.usuario, r.claveTemporal);
+                    loadAdminUsuarios();
+                    if (document.getElementById('adminBitacora')) loadAdminBitacora();
+                } catch (err) { adminError(err); }
+            });
+        }
+
+        async function loadAdminBitacora() {
+            try {
+                const r = await fetchJson('api/bitacora.php?limite=200');
+                document.getElementById('adminBitacora').innerHTML = r.data.map(a => `
+                    <tr class="border-b border-slate-100">
+                        <td class="py-2 px-4 text-slate-500 whitespace-nowrap">${escapeHtml(a.fecha.slice(0, 19))}</td>
+                        <td class="py-2 px-4 font-bold text-slate-800">${escapeHtml(a.usuario)}</td>
+                        <td class="py-2 px-4 ${/fallido|bloque|denegado|revocada/.test(a.evento) ? 'text-rose-600 font-bold' : ''}">${escapeHtml(EVENTOS[a.evento] ?? a.evento)}</td>
+                        <td class="py-2 px-4 text-slate-500">${escapeHtml(a.detalle)}</td>
+                        <td class="py-2 px-4 text-slate-400">${escapeHtml(a.ip)}</td>
+                    </tr>`).join('');
+            } catch (err) { adminError(err); }
+        }
 
         // Punto de entrada: inicializa la gráfica en vivo y carga el Dashboard
         window.onload = () => { loadScreen('dashboard'); };

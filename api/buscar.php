@@ -31,16 +31,21 @@
  *  - Una sola compra puede tener varias partidas (una por cada especie/talla descargada).
  */
 
-header("Access-Control-Allow-Origin: *");
-header("Content-Type: application/json; charset=UTF-8");
-
+require_once __DIR__ . '/../seguridad/sesion.php';
 require_once __DIR__ . '/../config/database.php';
 
+// Solo usuarios con sesión; todos los roles pueden consultar una compra
+requerirSesionApi();
+
 try {
-    $compra = trim($_GET['compra'] ?? '');
+    $compra = strtoupper(trim((string)($_GET['compra'] ?? '')));
 
     if ($compra === '') {
         throw new InvalidArgumentException("Debe proporcionar un código de compra.");
+    }
+    // Los códigos son letras y números; cualquier otra cosa se rechaza antes de llegar a la base
+    if (!preg_match('/^[A-Z0-9]{1,20}$/', $compra)) {
+        throw new InvalidArgumentException("El código de compra solo puede tener letras y números.");
     }
 
     $db = (new Database())->getConnection();

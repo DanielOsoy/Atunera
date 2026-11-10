@@ -53,6 +53,8 @@ class Database
                 PDO::ATTR_ERRMODE            => PDO::ERRMODE_EXCEPTION,
                 // Devuelve filas como arrays asociativos por defecto
                 PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
+                // Consultas preparadas reales en MySQL: los datos nunca se mezclan con el SQL
+                PDO::ATTR_EMULATE_PREPARES   => false,
             ]);
         } catch (PDOException $exception) {
             error_log("Error de conexión: " . $exception->getMessage());

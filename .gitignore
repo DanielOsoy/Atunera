@@ -1,2 +1,4 @@
 .devcontainer/.env
 *.env
+node_modules/
+.devcontainer/credenciales-temporales.txt

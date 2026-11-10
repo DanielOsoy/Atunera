@@ -154,7 +154,9 @@ ALTER TABLE `predicciones`
   ADD UNIQUE KEY `lote_partida_unique` (`lote`,`partida`),
   ADD KEY `proveedor_id` (`proveedor_id`),
   ADD KEY `especie_id` (`especie_id`),
-  ADD KEY `talla_id` (`talla_id`);
+  ADD KEY `talla_id` (`talla_id`),
+  ADD KEY `idx_predicciones_compra` (`compra`,`talla_id`),
+  ADD KEY `idx_predicciones_fecha` (`fecha_registro`);
 
 --
 -- Indices de la tabla `proveedores`
